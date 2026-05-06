@@ -1,9 +1,31 @@
 from typing import List, Dict, Optional, Tuple, Any, Union, Callable
 import json
+from concurrent.futures import ThreadPoolExecutor
 from mcp.types import TextContent as Content
 from proxmox_mcp.models import ToolResult
 from .base import ProxmoxTool
 from .console.container_manager import ContainerConsoleManager
+
+
+def _uptime(seconds: Any) -> str:
+    """seconds -> human uptime string, e.g. '3d 2h 15m'."""
+    try:
+        s = int(seconds)
+    except Exception:
+        return "unknown"
+    if s <= 0:
+        return "-"
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m or not parts:
+        parts.append(f"{m}m")
+    return " ".join(parts)
 
 
 def _b2h(n: Union[int, float, str]) -> str:
@@ -48,6 +70,33 @@ def _as_list(maybe: Any) -> List:
         if isinstance(data, list):
             return data
     return []
+
+
+def _parse_net_ips(config: dict) -> List[Dict]:
+    """Extract static IPs from container config net0/net1/... fields.
+
+    Config net field format: 'name=eth0,bridge=vmbr0,ip=172.18.187.36/32,gw=172.18.187.1'
+    Skips DHCP/manual/auto entries. Returns [{"name": "eth0", "inet": "x.x.x.x/prefix"}].
+    """
+    interfaces = []
+    for key in sorted(config):
+        if not key.startswith("net") or not key[3:].isdigit():
+            continue
+        val = config[key]
+        if not isinstance(val, str):
+            continue
+        parts = dict(kv.split("=", 1) for kv in val.split(",") if "=" in kv)
+        iface_name = parts.get("name", key)
+        inet = parts.get("ip", "")
+        inet6 = parts.get("ip6", "")
+        entry: Dict[str, Any] = {"name": iface_name}
+        if inet and inet.lower() not in ("dhcp", "manual", ""):
+            entry["inet"] = inet
+        if inet6 and inet6.lower() not in ("dhcp", "manual", "auto", ""):
+            entry["inet6"] = inet6
+        if "inet" in entry or "inet6" in entry:
+            interfaces.append(entry)
+    return interfaces
 
 
 class ContainerTools(ProxmoxTool):
@@ -113,6 +162,13 @@ class ContainerTools(ProxmoxTool):
         return out if out else None
 
     def _list_ct_pairs(self, node: Optional[str]) -> List[Tuple[str, Dict]]:
+        """Return (node_name, ct_dict) pairs.
+
+        When node is None: single /cluster/resources?type=lxc call — O(1) regardless
+        of cluster size. The returned dicts already contain cpu/mem/maxmem/cpus so
+        get_containers skips all per-container API calls.
+        When node is given: fall back to per-node /lxc endpoint.
+        """
         """Yield (node_name, ct_dict). Coerce odd shapes into dicts with vmid."""
         cluster_pairs = self._cluster_ct_pairs(node)
         if cluster_pairs is not None:
@@ -127,43 +183,23 @@ class ContainerTools(ProxmoxTool):
                     "Skipping node %s while listing containers: %s", node, e
                 )
                 return out
-
             for it in _as_list(raw):
                 if isinstance(it, dict):
                     out.append((node, it))
                 else:
                     try:
-                        vmid = int(it)
-                        out.append((node, {"vmid": vmid}))
+                        out.append((node, {"vmid": int(it)}))
                     except Exception:
                         continue
         else:
             try:
-                nodes = _as_list(self.proxmox.nodes.get())
+                resources = _as_list(self.proxmox.cluster.resources.get(type="vm"))
+                for r in resources:
+                    # filter client-side: keep only lxc (type=vm returns both qemu and lxc)
+                    if isinstance(r, dict) and r.get("node") and r.get("type") == "lxc":
+                        out.append((r["node"], r))
             except Exception as e:
                 self._handle_error("list containers", e)
-
-            for n in nodes:
-                nname = _get(n, "node")
-                if not nname:
-                    continue
-                try:
-                    raw = self.proxmox.nodes(nname).lxc.get()
-                except Exception as node_error:
-                    self.logger.warning(
-                        "Skipping node %s while listing containers: %s", nname, node_error
-                    )
-                    continue
-
-                for it in _as_list(raw):
-                    if isinstance(it, dict):
-                        out.append((nname, it))
-                    else:
-                        try:
-                            vmid = int(it)
-                            out.append((nname, {"vmid": vmid}))
-                        except Exception:
-                            continue
         return out
 
     def _rrd_last(self, node: str, vmid: int) -> Tuple[Optional[float], Optional[int], Optional[int]]:
@@ -209,8 +245,10 @@ class ContainerTools(ProxmoxTool):
             mem_pct = r.get("mem_pct")
             unlimited = bool(r.get("unlimited_memory", False))
 
+            uptime = _uptime(r.get("uptime", 0))
             lines.append(f"{name} (ID: {vmid})")
             lines.append(f"  - Status: {status}")
+            lines.append(f"  - Uptime: {uptime}")
             lines.append(f"  - Node: {node}")
             lines.append(f"  - CPU: {cpu_pct:.1f}%")
             lines.append(f"  - CPU Cores: {cores if cores is not None else 'N/A'}")
@@ -246,20 +284,21 @@ class ContainerTools(ProxmoxTool):
             pairs = self._list_ct_pairs(node)
             rows: List[Dict] = []
 
-            for nname, ct in pairs:
+            def _build_rec(nname: str, ct: Dict) -> Dict:
                 vmid_val = _get(ct, "vmid")
                 vmid_int: Optional[int] = None
                 try:
                     if vmid_val is not None:
                         vmid_int = int(vmid_val)
                 except Exception:
-                    vmid_int = None
+                    pass
 
                 rec: Dict = {
                     "vmid": str(vmid_val) if vmid_val is not None else None,
                     "name": _get(ct, "name") or _get(ct, "hostname") or (f"ct-{vmid_val}" if vmid_val is not None else "ct-?"),
                     "node": nname,
                     "status": _get(ct, "status"),
+                    "uptime": _get(ct, "uptime", 0),
                 }
                 base_cpu = _get(ct, "cpu")
                 base_mem = _get(ct, "mem")
@@ -287,73 +326,68 @@ class ContainerTools(ProxmoxTool):
                     rec["cores"] = base_maxcpu
 
                 if include_stats and vmid_int is not None:
-                    raw_status, raw_config = self._status_and_config(nname, vmid_int)
+                    # /cluster/resources already returns cpu/mem/maxmem/cpus — no extra calls needed.
+                    has_cluster_data = "cpu" in ct or "mem" in ct
 
-                    cpu_frac = float(_get(raw_status, "cpu", 0.0) or 0.0)
-                    cpu_pct = round(cpu_frac * 100.0, 2)
-                    mem_bytes = int(_get(raw_status, "mem", 0) or 0)
-                    maxmem_bytes = int(_get(raw_status, "maxmem", 0) or 0)
+                    if has_cluster_data:
+                        cpu_frac = float(ct.get("cpu", 0.0) or 0.0)
+                        cpu_pct = round(cpu_frac * 100.0, 2)
+                        mem_bytes = int(ct.get("mem", 0) or 0)
+                        maxmem_bytes = int(ct.get("maxmem", 0) or 0)
+                        cores: Optional[Union[int, float]] = ct.get("cpus")
+                        memory_mib = int(round(maxmem_bytes / (1024 * 1024))) if maxmem_bytes else 0
+                        unlimited_memory = maxmem_bytes == 0
+                    else:
+                        # Node-specific query: fetch status+config (called in parallel by caller).
+                        raw_status, raw_config = self._status_and_config(nname, vmid_int)
 
-                    memory_mib = 0
-                    cores: Optional[Union[int, float]] = None
-                    unlimited_memory = False
+                        cpu_frac = float(_get(raw_status, "cpu", 0.0) or 0.0)
+                        cpu_pct = round(cpu_frac * 100.0, 2)
+                        mem_bytes = int(_get(raw_status, "mem", 0) or 0)
+                        maxmem_bytes = int(_get(raw_status, "maxmem", 0) or 0)
 
-                    try:
-                        cfg_mem = _get(raw_config, "memory")
-                        if cfg_mem is None:
-                            cfg_mem = _get(raw_config, "ram")
-                        if cfg_mem is None:
-                            cfg_mem = _get(raw_config, "maxmem")
-                        if cfg_mem is None:
-                            cfg_mem = _get(raw_config, "memoryMiB")
-                        if cfg_mem is not None:
-                            try:
-                                memory_mib = int(cfg_mem)
-                            except Exception:
-                                memory_mib = 0
-                        else:
-                            memory_mib = 0
-
-                        unlimited_memory = bool(_get(raw_config, "swap", 0) == 0 and memory_mib == 0)
-
-                        cfg_cores = _get(raw_config, "cores")
-                        cfg_cpulimit = _get(raw_config, "cpulimit")
-                        if cfg_cores is not None:
-                            cores = int(cfg_cores)
-                        elif cfg_cpulimit is not None and float(cfg_cpulimit) > 0:
-                            cores = float(cfg_cpulimit)
-                    except Exception:
+                        memory_mib = 0
                         cores = None
+                        unlimited_memory = False
 
-                    # --- NEW: fallbacks for stopped / missing maxmem ---
-                    status_str = str(_get(raw_status, "status") or _get(ct, "status") or "").lower()
-                    
-                    if status_str == "stopped":
                         try:
-                            mem_bytes = 0
+                            cfg_mem = (_get(raw_config, "memory") or _get(raw_config, "ram")
+                                       or _get(raw_config, "maxmem") or _get(raw_config, "memoryMiB"))
+                            memory_mib = int(cfg_mem) if cfg_mem is not None else 0
+                            unlimited_memory = bool(_get(raw_config, "swap", 0) == 0 and memory_mib == 0)
+                            cfg_cores = _get(raw_config, "cores")
+                            cfg_cpulimit = _get(raw_config, "cpulimit")
+                            if cfg_cores is not None:
+                                cores = int(cfg_cores)
+                            elif cfg_cpulimit is not None and float(cfg_cpulimit) > 0:
+                                cores = float(cfg_cpulimit)
                         except Exception:
+                            pass
+
+                        status_str = str(_get(raw_status, "status") or _get(ct, "status") or "").lower()
+                        if status_str == "stopped":
                             mem_bytes = 0
+                        # uptime from list response; fall back to status/current
+                        if not rec.get("uptime"):
+                            rec["uptime"] = _get(raw_status, "uptime", 0)
+                        if (not maxmem_bytes) and memory_mib:
+                            maxmem_bytes = memory_mib * 1024 * 1024
 
-                    if (not maxmem_bytes or int(maxmem_bytes) == 0) and memory_mib and int(memory_mib) > 0:
-                        try:
-                            maxmem_bytes = int(memory_mib) * 1024 * 1024
-                        except Exception:
-                            maxmem_bytes = 0
-
-                    # RRD fallback if zeros
-                    if (mem_bytes == 0) or (maxmem_bytes == 0) or (cpu_pct == 0.0):
-                        rrd_cpu, rrd_mem, rrd_maxmem = self._rrd_last(nname, vmid_int)
-                        if cpu_pct == 0.0 and rrd_cpu is not None:
-                            cpu_pct = rrd_cpu
-                        if mem_bytes == 0 and rrd_mem is not None:
-                            mem_bytes = rrd_mem
-                        if maxmem_bytes == 0 and rrd_maxmem:
-                            maxmem_bytes = rrd_maxmem
-                            if memory_mib == 0:
-                                try:
+                        # RRD fallback only when values are missing (expensive — 1 extra call)
+                        if (mem_bytes == 0) or (maxmem_bytes == 0) or (cpu_pct == 0.0):
+                            rrd_cpu, rrd_mem, rrd_maxmem = self._rrd_last(nname, vmid_int)
+                            if cpu_pct == 0.0 and rrd_cpu is not None:
+                                cpu_pct = rrd_cpu
+                            if mem_bytes == 0 and rrd_mem is not None:
+                                mem_bytes = rrd_mem
+                            if maxmem_bytes == 0 and rrd_maxmem:
+                                maxmem_bytes = rrd_maxmem
+                                if memory_mib == 0:
                                     memory_mib = int(round(maxmem_bytes / (1024 * 1024)))
-                                except Exception:
-                                    memory_mib = 0
+
+                        if include_raw and format_style != "json":
+                            rec["raw_status"] = raw_status
+                            rec["raw_config"] = raw_config
 
                     rec.update({
                         "cores": cores,
@@ -372,11 +406,20 @@ class ContainerTools(ProxmoxTool):
                     if include_raw:
                         rec["raw_status"] = raw_status
                         rec["raw_config"] = raw_config
+                return rec
 
-                rows.append(rec)
+            # Cluster-wide path (has_cluster_data=True): all data already in pairs, no I/O in _build_rec.
+            # Node-specific path: parallelize the per-container status+config+RRD calls.
+            first_ct = pairs[0][1] if pairs else {}
+            use_parallel = bool(pairs) and not ("cpu" in first_ct or "mem" in first_ct)
+
+            if use_parallel:
+                with ThreadPoolExecutor(max_workers=20) as pool:
+                    rows = list(pool.map(lambda p: _build_rec(p[0], p[1]), pairs))
+            else:
+                rows = [_build_rec(n, ct) for n, ct in pairs]
 
             if format_style == "json":
-                # JSON path must be immune to any formatter assumptions; no raw payloads.
                 return self._json_fmt(rows)
             return self._render_pretty(rows)
 
@@ -908,8 +951,7 @@ class ContainerTools(ProxmoxTool):
                 )
             node, vmid, _label = targets[0]
             exec_result = self.console_manager.execute_command(node, str(vmid), command)
-            import json as _json
-            return [Content(type="text", text=_json.dumps(exec_result, indent=2))]
+            return [Content(type="text", text=json.dumps(exec_result, indent=2))]
         except Exception as e:
             return self._err("execute_command", e)
 
@@ -969,6 +1011,108 @@ class ContainerTools(ProxmoxTool):
             return self._json_fmt(result)
         except Exception as e:
             return self._err("get_container_ip", e)
+
+    def get_all_container_ips(self, node: Optional[str] = None) -> List[Content]:
+        """Return IP addresses for all LXC containers cluster-wide (or filtered by node).
+
+        Request budget:
+        - 1 call to /cluster/resources (via _list_ct_pairs)
+        - N parallel calls to /interfaces for running containers (actual runtime IPs)
+        - M parallel calls to /config for stopped containers (static IPs from net0/net1)
+        Total: 1 + max(N_running, N_stopped) effective round-trips.
+        """
+        try:
+            pairs = self._list_ct_pairs(node)
+            if not pairs:
+                return [Content(type="text", text="No containers found")]
+
+            def _fetch_running(nname: str, ct: Dict) -> Dict:
+                vmid = str(_get(ct, "vmid", ""))
+                name = _get(ct, "name") or _get(ct, "hostname") or f"ct-{vmid}"
+                try:
+                    ifaces_raw = _as_list(self.proxmox.nodes(nname).lxc(vmid).interfaces.get())
+                    interfaces: List[Dict] = []
+                    primary_ip: Optional[str] = None
+                    for iface in ifaces_raw:
+                        iface_name = iface.get("name") or iface.get("iface")
+                        if not iface_name or iface_name == "lo":
+                            continue
+                        entry: Dict[str, Any] = {"name": iface_name}
+                        inet = iface.get("inet")
+                        inet6 = iface.get("inet6")
+                        if inet:
+                            entry["inet"] = inet
+                            if primary_ip is None:
+                                primary_ip = inet.split("/")[0]
+                        if inet6:
+                            entry["inet6"] = inet6
+                        interfaces.append(entry)
+                    return {"vmid": vmid, "name": name, "node": nname, "status": "running",
+                            "interfaces": interfaces, "primary_ip": primary_ip}
+                except Exception as e:
+                    return {"vmid": vmid, "name": name, "node": nname, "status": "running",
+                            "interfaces": [], "primary_ip": None, "error": str(e)}
+
+            def _fetch_stopped(nname: str, ct: Dict) -> Dict:
+                vmid = str(_get(ct, "vmid", ""))
+                name = _get(ct, "name") or _get(ct, "hostname") or f"ct-{vmid}"
+                try:
+                    config = _as_dict(self.proxmox.nodes(nname).lxc(vmid).config.get())
+                    cfg_name = config.get("hostname")
+                    if cfg_name:
+                        name = cfg_name
+                    interfaces = _parse_net_ips(config)
+                    primary_ip = next(
+                        (iface["inet"].split("/")[0] for iface in interfaces if iface.get("inet")),
+                        None,
+                    )
+                    return {"vmid": vmid, "name": name, "node": nname, "status": "stopped",
+                            "interfaces": interfaces, "primary_ip": primary_ip}
+                except Exception as e:
+                    return {"vmid": vmid, "name": name, "node": nname, "status": "stopped",
+                            "interfaces": [], "primary_ip": None, "error": str(e)}
+
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                future_list = []
+                for nname, ct in pairs:
+                    ct_status = _get(ct, "status", "unknown")
+                    if ct_status == "running":
+                        future_list.append(pool.submit(_fetch_running, nname, ct))
+                    else:
+                        future_list.append(pool.submit(_fetch_stopped, nname, ct))
+                results = [f.result() for f in future_list]
+
+            results.sort(key=lambda x: int(x.get("vmid") or 0))
+
+            lines = ["Container IPs", ""]
+            for r in results:
+                vmid = r.get("vmid", "?")
+                name = r.get("name", f"ct-{vmid}")
+                node_name = r.get("node", "?")
+                status = (r.get("status") or "").upper()
+                ifaces = r.get("interfaces", [])
+                error = r.get("error")
+
+                lines.append(f"{name} (ID: {vmid}, {node_name}) [{status}]")
+                if error:
+                    lines.append(f"  - Error: {error}")
+                elif not ifaces:
+                    lines.append("  - No IPs / DHCP (no static config)")
+                else:
+                    for iface in ifaces:
+                        iname = iface.get("name", "?")
+                        ip_parts = []
+                        if iface.get("inet"):
+                            ip_parts.append(iface["inet"].split("/")[0])
+                        if iface.get("inet6"):
+                            ip_parts.append(iface["inet6"].split("/")[0])
+                        lines.append(f"  - {iname}: {', '.join(ip_parts)}")
+                lines.append("")
+
+            return [Content(type="text", text="\n".join(lines).rstrip())]
+
+        except Exception as e:
+            return self._err("get_all_container_ips", e)
 
     def update_container_ssh_keys(
         self,

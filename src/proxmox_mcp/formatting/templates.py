@@ -21,75 +21,94 @@ class ProxmoxTemplates:
         result = [f"{ProxmoxTheme.RESOURCES['node']} Proxmox Nodes"]
         
         for node in nodes:
-            # Get node status
             status = node.get("status", "unknown")
-            
-            # Get memory info
             memory = node.get("memory", {})
             memory_used = memory.get("used", 0)
             memory_total = memory.get("total", 0)
             memory_percent = (memory_used / memory_total * 100) if memory_total > 0 else 0
-            
-            # Format node info
+            cpu_usage = node.get("cpu_usage", 0)
+
             result.extend([
-                "",  # Empty line between nodes
+                "",
                 f"{ProxmoxTheme.RESOURCES['node']} {node['node']}",
                 f"  - Status: {status.upper()}",
                 f"  - Uptime: {ProxmoxFormatters.format_uptime(node.get('uptime', 0))}",
-                f"  - CPU Cores: {node.get('maxcpu', 'N/A')}",
+                f"  - CPU: {cpu_usage:.1f}%  ({node.get('maxcpu', 'N/A')} cores)",
                 f"  - Memory: {ProxmoxFormatters.format_bytes(memory_used)} / "
-                f"{ProxmoxFormatters.format_bytes(memory_total)} ({memory_percent:.1f}%)"
+                f"{ProxmoxFormatters.format_bytes(memory_total)} ({memory_percent:.1f}%)",
             ])
-            
-            # Add disk usage if available
-            disk = node.get("disk", {})
-            if disk:
-                disk_used = disk.get("used", 0)
-                disk_total = disk.get("total", 0)
-                disk_percent = (disk_used / disk_total * 100) if disk_total > 0 else 0
-                result.append(
-                    f"  - Disk: {ProxmoxFormatters.format_bytes(disk_used)} / "
-                    f"{ProxmoxFormatters.format_bytes(disk_total)} ({disk_percent:.1f}%)"
-                )
-            
+
+            disk_io = node.get("disk_io")
+            if disk_io is not None:
+                iowait = disk_io.get("iowait_pct", 0)
+                pressure = disk_io.get("pressure_io_some", 0)
+                parts = [f"{iowait:.2f}% iowait"]
+                if pressure:
+                    parts.append(f"{pressure:.1f}% io pressure")
+                result.append(f"  - Disk I/O: {',  '.join(parts)}")
+
         return "\n".join(result)
     
     @staticmethod
     def node_status(node: str, status: Dict[str, Any]) -> str:
-        """Template for detailed node status output.
-        
-        Args:
-            node: Node name
-            status: Node status data
-            
-        Returns:
-            Formatted node status string
-        """
+        """Template for detailed node status output."""
+        cpu = status.get("cpu", {})
+        cpu_usage = cpu.get("usage", 0)
+        cpu_cores = cpu.get("cores", "N/A")
+        cpu_mhz = cpu.get("mhz", "")
+
         memory = status.get("memory", {})
         memory_used = memory.get("used", 0)
         memory_total = memory.get("total", 0)
         memory_percent = (memory_used / memory_total * 100) if memory_total > 0 else 0
-        
+
         result = [
             f"{ProxmoxTheme.RESOURCES['node']} Node: {node}",
             f"  - Status: {status.get('status', 'unknown').upper()}",
             f"  - Uptime: {ProxmoxFormatters.format_uptime(status.get('uptime', 0))}",
-            f"  - CPU Cores: {status.get('maxcpu', 'N/A')}",
+            f"  - CPU: {cpu_usage:.1f}%  ({cpu_cores} cores"
+            + (f", {cpu_mhz} MHz" if cpu_mhz else "") + ")",
             f"  - Memory: {ProxmoxFormatters.format_bytes(memory_used)} / "
-            f"{ProxmoxFormatters.format_bytes(memory_total)} ({memory_percent:.1f}%)"
+            f"{ProxmoxFormatters.format_bytes(memory_total)} ({memory_percent:.1f}%)",
         ]
-        
-        # Add disk usage if available
-        disk = status.get("disk", {})
-        if disk:
-            disk_used = disk.get("used", 0)
-            disk_total = disk.get("total", 0)
-            disk_percent = (disk_used / disk_total * 100) if disk_total > 0 else 0
+
+        swap = status.get("swap", {})
+        swap_used = swap.get("used", 0)
+        swap_total = swap.get("total", 0)
+        if swap_total > 0:
+            swap_percent = swap_used / swap_total * 100
             result.append(
-                f"  - Disk: {ProxmoxFormatters.format_bytes(disk_used)} / "
-                f"{ProxmoxFormatters.format_bytes(disk_total)} ({disk_percent:.1f}%)"
+                f"  - Swap: {ProxmoxFormatters.format_bytes(swap_used)} / "
+                f"{ProxmoxFormatters.format_bytes(swap_total)} ({swap_percent:.1f}%)"
             )
-        
+
+        rootfs = status.get("rootfs", {})
+        rootfs_used = rootfs.get("used", 0)
+        rootfs_total = rootfs.get("total", 0)
+        if rootfs_total > 0:
+            rootfs_percent = rootfs_used / rootfs_total * 100
+            result.append(
+                f"  - Root disk: {ProxmoxFormatters.format_bytes(rootfs_used)} / "
+                f"{ProxmoxFormatters.format_bytes(rootfs_total)} ({rootfs_percent:.1f}%)"
+            )
+
+        disk_io = status.get("disk_io")
+        if disk_io is not None:
+            iowait = disk_io.get("iowait_pct", 0)
+            pressure = disk_io.get("pressure_io_some", 0)
+            parts = [f"{iowait:.2f}% iowait"]
+            if pressure:
+                parts.append(f"{pressure:.1f}% io pressure")
+            result.append(f"  - Disk I/O: {',  '.join(parts)}")
+
+        loadavg = status.get("loadavg", [])
+        if loadavg:
+            result.append(f"  - Load avg: {' / '.join(str(x) for x in loadavg[:3])}")
+
+        pveversion = status.get("pveversion", "")
+        if pveversion:
+            result.append(f"  - PVE version: {pveversion}")
+
         return "\n".join(result)
     
     @staticmethod

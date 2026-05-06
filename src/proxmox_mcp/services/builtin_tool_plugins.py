@@ -25,6 +25,7 @@ from proxmox_mcp.tools.definitions import (
     GET_JOB_DESC,
     GET_CLUSTER_STATUS_DESC,
     GET_CONTAINER_CONFIG_DESC,
+    GET_ALL_CONTAINER_IPS_DESC,
     GET_CONTAINER_IP_DESC,
     GET_CONTAINERS_DESC,
     GET_NODES_DESC,
@@ -546,6 +547,14 @@ class ContainerToolsPlugin(RegistryPluginBase):
             return self._wrap_sync(server, "get_container_ip", server.container_tools.get_container_ip)(
                 node=node,
                 vmid=vmid,
+            )
+
+        @server.mcp.tool(description=GET_ALL_CONTAINER_IPS_DESC)
+        def get_all_container_ips(
+            node: Annotated[Optional[str], Field(description="Optional node name to filter (omit for all nodes)", default=None)] = None,
+        ) -> Any:
+            return self._wrap_sync(server, "get_all_container_ips", server.container_tools.get_all_container_ips)(
+                node=node,
             )
 
 

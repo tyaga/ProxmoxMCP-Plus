@@ -1,6 +1,7 @@
 """Backup and restore tools for Proxmox MCP."""
 from typing import List, Dict, Optional, Any
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from mcp.types import TextContent as Content
 from proxmox_mcp.tools.base import ProxmoxTool
@@ -74,48 +75,49 @@ class BackupTools(ProxmoxTool):
             except Exception as e:
                 self._handle_error("list nodes", e)
 
-            for n in nodes:
-                node_name = _get(n, "node")
-                if not node_name:
-                    continue
-                if node and node_name != node:
-                    continue
+            node_names = [
+                _get(n, "node") for n in nodes
+                if _get(n, "node") and (not node or _get(n, "node") == node)
+            ]
 
+            def _fetch_node_backups(node_name: str) -> List[Dict]:
+                items: List[Dict] = []
                 try:
                     storages = _as_list(self.proxmox.nodes(node_name).storage.get())
                 except Exception as node_error:
-                    self.logger.warning(
-                        "Skipping node %s while listing backups: %s",
-                        node_name,
-                        node_error,
-                    )
-                    continue
-                for s in storages:
+                    self.logger.warning("Skipping node %s while listing backups: %s", node_name, node_error)
+                    return items
+
+                def _fetch_storage_backups(s: dict) -> List[Dict]:
                     storage_name = _get(s, "storage")
                     if not storage_name:
-                        continue
+                        return []
                     if storage and storage_name != storage:
-                        continue
-
-                    # Check if storage supports backups
-                    content_types = _get(s, "content", "")
-                    if "backup" not in content_types:
-                        continue
-
+                        return []
+                    if "backup" not in _get(s, "content", ""):
+                        return []
                     try:
                         params: Dict[str, Any] = {"content": "backup"}
                         if vmid:
                             params["vmid"] = int(vmid)
-
                         content = _as_list(
                             self.proxmox.nodes(node_name).storage(storage_name).content.get(**params)
                         )
                         for item in content:
                             item["_node"] = node_name
                             item["_storage"] = storage_name
-                            results.append(item)
+                        return content
                     except Exception:
-                        continue
+                        return []
+
+                with ThreadPoolExecutor(max_workers=5) as pool:
+                    for chunk in pool.map(_fetch_storage_backups, storages):
+                        items.extend(chunk)
+                return items
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                for chunk in pool.map(_fetch_node_backups, node_names):
+                    results.extend(chunk)
 
             if not results:
                 msg = "No backups found"

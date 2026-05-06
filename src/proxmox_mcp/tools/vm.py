@@ -20,6 +20,7 @@ from mcp.types import TextContent as Content
 from proxmox_mcp.models import ToolResult
 from proxmox_mcp.tools.base import ProxmoxTool
 from proxmox_mcp.tools.console.manager import VMConsoleManager
+from concurrent.futures import ThreadPoolExecutor
 
 class VMTools(ProxmoxTool):
     """Tools for managing Proxmox VMs.
@@ -122,57 +123,43 @@ class VMTools(ProxmoxTool):
             return self._format_response(cluster_inventory, "vms")
 
         try:
-            nodes = self.proxmox.nodes.get()
+            # Single call returns all VMs across all nodes with cpu/mem/maxmem/cpus included.
+            resources = self.proxmox.cluster.resources.get(type="vm")
         except Exception as e:
             self._handle_error("get VMs", e)
 
         result = []
         try:
-            for node in nodes:
-                node_name = node.get("node") if isinstance(node, dict) else None
-                if not node_name:
-                    self.logger.warning(
-                        "Skipping unexpected node entry while gathering VM list: %s",
-                        node,
-                    )
-                    continue
-                try:
-                    vms = self.proxmox.nodes(node_name).qemu.get()
-                except Exception as node_error:
-                    self.logger.warning(
-                        "Skipping node %s while gathering VM list: %s", node_name, node_error
-                    )
-                    continue
+            all_resources = resources if isinstance(resources, list) else (resources.get("data", []) if isinstance(resources, dict) else [])
+            # cluster/resources?type=vm returns both qemu and lxc — keep only qemu
+            vms = [r for r in all_resources if isinstance(r, dict) and r.get("type") == "qemu"]
 
-                for vm in vms:
-                    vmid = vm["vmid"]
-                    # Get VM config for CPU cores
+            def _enrich(vm: dict) -> dict:
+                node_name = vm.get("node")
+                vmid = vm.get("vmid")
+                # /cluster/resources includes cpus; only fall back to config if missing.
+                cpus = vm.get("cpus", "N/A")
+                if cpus == "N/A" and node_name and vmid:
                     try:
                         config = self.proxmox.nodes(node_name).qemu(vmid).config.get()
-                        result.append({
-                            "vmid": vmid,
-                            "name": vm["name"],
-                            "status": vm["status"],
-                            "node": node_name,
-                            "cpus": config.get("cores", "N/A"),
-                            "memory": {
-                                "used": vm.get("mem", 0),
-                                "total": vm.get("maxmem", 0)
-                            }
-                        })
+                        cpus = config.get("cores", "N/A")
                     except Exception:
-                        # Fallback if can't get config
-                        result.append({
-                            "vmid": vmid,
-                            "name": vm["name"],
-                            "status": vm["status"],
-                            "node": node_name,
-                            "cpus": "N/A",
-                            "memory": {
-                                "used": vm.get("mem", 0),
-                                "total": vm.get("maxmem", 0)
-                            }
-                        })
+                        pass
+                return {
+                    "vmid": vmid,
+                    "name": vm.get("name", f"vm-{vmid}"),
+                    "status": vm.get("status"),
+                    "node": node_name,
+                    "cpus": cpus,
+                    "memory": {
+                        "used": vm.get("mem", 0),
+                        "total": vm.get("maxmem", 0),
+                    },
+                }
+
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                result = list(pool.map(_enrich, vms))
+
         except Exception as e:
             self._handle_error("get VMs", e)
 

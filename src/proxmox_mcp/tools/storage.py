@@ -13,6 +13,7 @@ The tools implement fallback mechanisms for scenarios where
 detailed storage information might be temporarily unavailable.
 """
 from typing import List
+from concurrent.futures import ThreadPoolExecutor
 from mcp.types import TextContent as Content
 from proxmox_mcp.tools.base import ProxmoxTool
 
@@ -129,31 +130,24 @@ class StorageTools(ProxmoxTool):
         try:
             result = self._call_with_retry("get storage", lambda: self.proxmox.storage.get())
             node_names = self._node_names()
-            storage = []
-            
-            for store in result:
+
+            def _fetch_store(store: dict) -> dict:
                 status = self._storage_status(store, node_names)
+                base = {
+                    "storage": store["storage"],
+                    "type": store["type"],
+                    "content": store.get("content", []),
+                    "status": "online" if store.get("enabled", True) else "offline",
+                }
                 if status is not None:
-                    storage.append({
-                        "storage": store["storage"],
-                        "type": store["type"],
-                        "content": store.get("content", []),
-                        "status": "online" if store.get("enabled", True) else "offline",
-                        "used": status.get("used", 0),
-                        "total": status.get("total", 0),
-                        "available": status.get("avail", 0)
-                    })
+                    base.update({"used": status.get("used", 0), "total": status.get("total", 0), "available": status.get("avail", 0)})
                 else:
-                    storage.append({
-                        "storage": store["storage"],
-                        "type": store["type"],
-                        "content": store.get("content", []),
-                        "status": "online" if store.get("enabled", True) else "offline",
-                        "used": 0,
-                        "total": 0,
-                        "available": 0
-                    })
-                    
+                    base.update({"used": 0, "total": 0, "available": 0})
+                return base
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                storage = list(pool.map(_fetch_store, result))
+
             self._cache_set("storage:list", storage, ttl_seconds=10)
             return self._format_response(storage, "storage")
         except Exception as e:

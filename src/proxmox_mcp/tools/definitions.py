@@ -30,24 +30,37 @@ The same job_id is preserved and its attempt counter is incremented.
 """
 
 # Node tool descriptions
-GET_NODES_DESC = """List all nodes in the Proxmox cluster with their status, CPU, memory, and role information.
+GET_NODES_DESC = """List all nodes in the Proxmox cluster with status, CPU load, memory usage, and disk I/O wait.
 
-Example:
-{"node": "pve1", "status": "online", "cpu_usage": 0.15, "memory": {"used": "8GB", "total": "32GB"}}"""
+Returns per node:
+- CPU: current usage % and core count
+- Memory: used / total
+- Disk I/O: iowait % and io pressure %  (from RRD last-minute average)
 
-GET_NODE_STATUS_DESC = """Get detailed status information for a specific Proxmox node.
+Use this to check cluster-wide disk load, CPU load, or memory pressure across all nodes."""
+
+GET_NODE_STATUS_DESC = """Get detailed status for a specific Proxmox node including CPU, memory, swap, disk space, disk I/O wait, and load average.
 
 Parameters:
-node* - Name/ID of node to query (e.g. 'pve1')
+node* - Node name (e.g. 'pve1')
 
-Example:
-{"cpu": {"usage": 0.15}, "memory": {"used": "8GB", "total": "32GB"}}"""
+Returns:
+- CPU: current usage % and core count and MHz
+- Memory and swap: used / total
+- Root disk: used / total space
+- Disk I/O: iowait % and io pressure %  (from RRD last-minute average; node-level RRD does not expose per-disk throughput)
+- Load average: 1 / 5 / 15 min
+- PVE version
+
+Use this when you need disk I/O load, CPU usage, or memory details for a single node."""
 
 # VM tool descriptions
 GET_VMS_DESC = """List all virtual machines across the cluster with their status and resource usage.
 
+Returns per VM: vmid, name, status, node, cpus (core count), memory (used/total bytes).
+
 Example:
-{"vmid": "100", "name": "ubuntu", "status": "running", "cpu": 2, "memory": 4096}"""
+{"vmid": "100", "name": "ubuntu", "status": "running", "node": "pve1", "cpus": 2, "memory": {"used": 2147483648, "total": 4294967296}}"""
 
 CREATE_VM_DESC = """Create a new virtual machine with specified configuration.
 
@@ -156,11 +169,12 @@ Parameters:
 - include_raw (bool, default false): Include raw Proxmox API payloads for debugging
 - format_style ('pretty'|'json', default 'pretty'): Pretty text or raw JSON list
 
+Returns per container: name, vmid, node, status, uptime, CPU usage %, CPU cores, memory used/total.
+
 Notes:
-- Live stats from /nodes/{node}/lxc/{vmid}/status/current.
+- Uses /cluster/resources for all containers in one request (fast, no N+1 queries).
 - If maxmem is 0 (unlimited), memory limit falls back to /config.memory (MiB).
-- If live returns zeros, the most recent RRD sample is used as a fallback.
-- Fields provided: cores (CPU cores/cpulimit), memory (MiB limit), cpu_pct, mem_bytes, maxmem_bytes, mem_pct, unlimited_memory.
+- If live stats return zeros, the most recent RRD sample is used as fallback.
 """
 
 START_CONTAINER_DESC = """Start one or more LXC containers.
@@ -249,10 +263,9 @@ Requirements:
 """
 
 # Storage tool descriptions
-GET_STORAGE_DESC = """List storage pools across the cluster with their usage and configuration.
+GET_STORAGE_DESC = """List storage pools across the cluster with their type, content types, and usage (used/total/available space).
 
-Example:
-{"storage": "local-lvm", "type": "lvm", "used": "500GB", "total": "1TB"}"""
+Returns per pool: storage name, type, supported content types, status (online/offline), used bytes, total bytes, available bytes."""
 
 # Cluster tool descriptions
 GET_CLUSTER_STATUS_DESC = """Get overall Proxmox cluster health and configuration status.
@@ -433,6 +446,22 @@ vmid* - Container ID (e.g. '101')
 
 Returns:
 {"vmid": "101", "name": "valkey", "interfaces": [...], "primary_ip": "10.1.0.101"}
+"""
+
+GET_ALL_CONTAINER_IPS_DESC = """Get IP addresses for all LXC containers cluster-wide (or filtered by node).
+
+Minimises API calls: 1 call to /cluster/resources, then parallel /interfaces (running)
+or /config (stopped) calls — total 1 + N round-trips instead of N*2 sequential.
+
+Parameters:
+node - Optional Proxmox node name to filter results (omit for all nodes)
+
+Returns:
+  Container IPs
+  valkey (ID: 101, pve1) [RUNNING]
+    - eth0: 10.1.0.101
+  nginx (ID: 102, pve2) [STOPPED]
+    - eth0: 10.1.0.102
 """
 
 UPDATE_CONTAINER_SSH_KEYS_DESC = """Inject or replace SSH authorized_keys for root in an LXC container.
